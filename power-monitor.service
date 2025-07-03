@@ -1,0 +1,15 @@
+[Unit]
+Description=Power Cut Monitor Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/power-monitor
+EnvironmentFile=/etc/power-monitor/power-monitor.env
+ExecStart=/opt/power-monitor/venv/bin/python /opt/power-monitor/power_monitor.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

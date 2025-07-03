@@ -1,0 +1,19 @@
+{
+  "monitored_devices": [
+    {
+      "name": "Smart Plug Living Room",
+      "ip": "192.168.1.100",
+      "description": "TP-Link Kasa Smart Plug in living room"
+    },
+    {
+      "name": "Smart Bulb Kitchen",
+      "ip": "192.168.1.101",
+      "description": "Philips Hue bulb in kitchen"
+    },
+    {
+      "name": "WiFi Router",
+      "ip": "192.168.1.1",
+      "description": "Main router - reliable power indicator"
+    }
+  ]
+}
