@@ -134,12 +134,12 @@ Edit `/etc/power-monitor/devices.json`:
 The bot supports these commands:
 
 - `/status` - Check current power status
-- `/history` - View power outage history (last 30 days)
+- `/history` - View power outage history (last 30 days) with pagination
 - `/fix` - Fix stuck states if status appears incorrect
 - `/help` - Show help message
 - `/start` - Welcome message and instructions
 
-Interactive buttons are provided for easy access to these commands.
+Interactive buttons are provided for easy access to these commands. The history command now includes pagination with Previous/Next buttons to navigate through all records when there are more than 10 entries.
 
 ## Service Management
 

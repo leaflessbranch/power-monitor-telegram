@@ -352,14 +352,29 @@ class TelegramBot:
 
     async def cmd_history(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /history command"""
-        cuts = self.monitor.get_power_cut_history(30)
+        await self.show_history_page(update, context, page=0)
 
+    async def show_history_page(self, update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 0):
+        """Show paginated history"""
+        cuts = self.monitor.get_power_cut_history(30)
+        items_per_page = 10
+        total_pages = (len(cuts) + items_per_page - 1) // items_per_page if cuts else 1
+        
+        # Ensure page is within bounds
+        page = max(0, min(page, total_pages - 1))
+        
         if not cuts:
             message = "📊 *Power Cut History (Last 30 Days)*\n\nNo power cuts recorded."
+            keyboard = self.get_keyboard()
         else:
-            message = "📊 *Power Cut History (Last 30 Days)*\n\n"
+            start_idx = page * items_per_page
+            end_idx = min(start_idx + items_per_page, len(cuts))
+            page_cuts = cuts[start_idx:end_idx]
+            
+            message = f"📊 *Power Cut History (Last 30 Days)*\n"
+            message += f"📄 Page {page + 1} of {total_pages}\n\n"
 
-            for i, cut in enumerate(cuts[:10]):  # Show last 10
+            for cut in page_cuts:
                 start_time = datetime.fromisoformat(cut["start_time"])
                 status_icon = "🔴" if cut["status"] == "ongoing" else "✅"
 
@@ -373,9 +388,6 @@ class TelegramBot:
 
                 message += "\n"
 
-            if len(cuts) > 10:
-                message += f"\n_... and {len(cuts) - 10} more_"
-
             # Add statistics
             total_cuts = len([c for c in cuts if c["status"] == "completed"])
             total_duration = sum(c["duration_seconds"] or 0 for c in cuts if c["duration_seconds"])
@@ -387,8 +399,15 @@ class TelegramBot:
                 f"Total Downtime: {self.monitor.format_duration(total_duration)}\n"
                 f"Average Duration: {self.monitor.format_duration(avg_duration)}"
             )
+            
+            # Create pagination keyboard
+            keyboard = self.get_history_keyboard(page, total_pages)
 
-        await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN, reply_markup=self.get_keyboard())
+        if hasattr(update, 'message') and update.message:
+            await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+        else:
+            # This is a callback query, edit the existing message
+            await update.callback_query.edit_message_text(message, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
 
     async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /help command"""
@@ -456,6 +475,34 @@ class TelegramBot:
         ]
         return InlineKeyboardMarkup(keyboard)
     
+    def get_history_keyboard(self, current_page: int, total_pages: int):
+        """Create pagination keyboard for history"""
+        keyboard = []
+        
+        # Pagination row
+        pagination_row = []
+        if current_page > 0:
+            pagination_row.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"history_page_{current_page - 1}"))
+        if current_page < total_pages - 1:
+            pagination_row.append(InlineKeyboardButton("Next ➡️", callback_data=f"history_page_{current_page + 1}"))
+        
+        if pagination_row:
+            keyboard.append(pagination_row)
+        
+        # Main command buttons
+        keyboard.extend([
+            [
+                InlineKeyboardButton("📊 Status", callback_data="status"),
+                InlineKeyboardButton("🔄 Refresh", callback_data="history")
+            ],
+            [
+                InlineKeyboardButton("🔧 Fix", callback_data="fix"),
+                InlineKeyboardButton("❓ Help", callback_data="help")
+            ]
+        ])
+        
+        return InlineKeyboardMarkup(keyboard)
+    
     async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle button presses"""
         query = update.callback_query
@@ -467,11 +514,17 @@ class TelegramBot:
             message=query.message
         )
         
+        # Handle pagination callbacks
+        if query.data.startswith("history_page_"):
+            page = int(query.data.split("_")[-1])
+            fake_update.callback_query = query
+            await self.show_history_page(fake_update, context, page=page)
         # Map callback data to command methods
-        if query.data == "status":
+        elif query.data == "status":
             await self.cmd_status(fake_update, context)
         elif query.data == "history":
-            await self.cmd_history(fake_update, context)
+            fake_update.callback_query = query
+            await self.show_history_page(fake_update, context, page=0)
         elif query.data == "help":
             await self.cmd_help(fake_update, context)
         elif query.data == "fix":
