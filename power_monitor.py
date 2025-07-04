@@ -354,7 +354,7 @@ class TelegramBot:
         """Handle /history command"""
         await self.show_history_page(update, context, page=0)
 
-    async def show_history_page(self, update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 0):
+    async def show_history_page(self, update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 0, is_callback: bool = False):
         """Show paginated history"""
         cuts = self.monitor.get_power_cut_history(30)
         items_per_page = 10
@@ -403,11 +403,12 @@ class TelegramBot:
             # Create pagination keyboard
             keyboard = self.get_history_keyboard(page, total_pages)
 
-        if hasattr(update, 'message') and update.message:
-            await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
-        else:
+        if is_callback:
             # This is a callback query, edit the existing message
             await update.callback_query.edit_message_text(message, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+        else:
+            # This is a regular command, send new message
+            await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
 
     async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /help command"""
@@ -508,26 +509,33 @@ class TelegramBot:
         query = update.callback_query
         await query.answer()
         
-        # Create a fake update with the query message for command reuse
-        fake_update = Update(
-            update_id=update.update_id,
-            message=query.message
-        )
-        
         # Handle pagination callbacks
         if query.data.startswith("history_page_"):
             page = int(query.data.split("_")[-1])
-            fake_update.callback_query = query
-            await self.show_history_page(fake_update, context, page=page)
+            await self.show_history_page(update, context, page=page, is_callback=True)
         # Map callback data to command methods
         elif query.data == "status":
+            # Create a fake update with the query message for command reuse
+            fake_update = Update(
+                update_id=update.update_id,
+                message=query.message
+            )
             await self.cmd_status(fake_update, context)
         elif query.data == "history":
-            fake_update.callback_query = query
-            await self.show_history_page(fake_update, context, page=0)
+            await self.show_history_page(update, context, page=0, is_callback=True)
         elif query.data == "help":
+            # Create a fake update with the query message for command reuse
+            fake_update = Update(
+                update_id=update.update_id,
+                message=query.message
+            )
             await self.cmd_help(fake_update, context)
         elif query.data == "fix":
+            # Create a fake update with the query message for command reuse
+            fake_update = Update(
+                update_id=update.update_id,
+                message=query.message
+            )
             await self.cmd_fix(fake_update, context)
 
     async def run(self):
