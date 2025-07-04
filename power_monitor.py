@@ -12,6 +12,7 @@ import subprocess
 from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
 
 def load_device_config():
     """Load device configuration from file"""
@@ -405,7 +406,15 @@ class TelegramBot:
 
         if is_callback:
             # This is a callback query, edit the existing message
-            await update.callback_query.edit_message_text(message, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+            try:
+                await update.callback_query.edit_message_text(message, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+            except BadRequest as e:
+                if "Message is not modified" in str(e):
+                    # Message content is identical, just acknowledge the callback
+                    logger.debug("Message content unchanged, skipping edit")
+                else:
+                    # Re-raise other BadRequest errors
+                    raise
         else:
             # This is a regular command, send new message
             await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
