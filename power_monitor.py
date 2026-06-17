@@ -35,6 +35,8 @@ def load_device_config():
 CONFIG = {
     "telegram_bot_token": os.environ.get("TELEGRAM_BOT_TOKEN"),
     "telegram_chat_id": os.environ.get("TELEGRAM_CHAT_ID"),
+    "telegram_base_url": os.environ.get("TELEGRAM_BASE_URL", "https://api.telegram.org/bot"),
+    "telegram_base_file_url": os.environ.get("TELEGRAM_BASE_FILE_URL", "https://api.telegram.org/file/bot"),
     "monitored_devices": load_device_config(),
     "check_interval": 30,  # seconds
     "ping_timeout": 5,     # seconds
@@ -66,7 +68,11 @@ logger = logging.getLogger(__name__)
 class PowerMonitor:
     def __init__(self):
         self.db_path = CONFIG["db_path"]
-        self.bot = Bot(token=CONFIG["telegram_bot_token"])
+        self.bot = Bot(
+            token=CONFIG["telegram_bot_token"],
+            base_url=CONFIG["telegram_base_url"],
+            base_file_url=CONFIG["telegram_base_file_url"],
+        )
         self.chat_id = CONFIG["telegram_chat_id"]
         self.current_status = "UNKNOWN"
         self.last_outage_start = None
@@ -324,7 +330,13 @@ class PowerMonitor:
 class TelegramBot:
     def __init__(self, monitor: PowerMonitor):
         self.monitor = monitor
-        self.application = Application.builder().token(CONFIG["telegram_bot_token"]).build()
+        self.application = (
+            Application.builder()
+            .token(CONFIG["telegram_bot_token"])
+            .base_url(CONFIG["telegram_base_url"])
+            .base_file_url(CONFIG["telegram_base_file_url"])
+            .build()
+        )
 
         # Add command handlers
         self.application.add_handler(CommandHandler("status", self.cmd_status))
