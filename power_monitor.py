@@ -9,6 +9,8 @@ import logging
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 import subprocess
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 from telegram.constants import ParseMode
@@ -48,6 +50,12 @@ CONFIG = {
     # An outage is only reported as "confirmed" once it has lasted this long.
     # Consumers that take disruptive action should ignore unconfirmed outages.
     "confirm_after": int(os.environ.get("POWER_MONITOR_CONFIRM_AFTER", "600")),  # seconds
+    # Optional read-only HTTP endpoint serving the same state, for consumers on
+    # other machines. Disabled unless a port is set. Stdlib only, no new deps.
+    # Bind to a LAN address or 0.0.0.0; the payload carries nothing sensitive,
+    # but there is no auth, so do not expose it to the internet.
+    "http_port": int(os.environ.get("POWER_MONITOR_HTTP_PORT", "0")),
+    "http_bind": os.environ.get("POWER_MONITOR_HTTP_BIND", "0.0.0.0"),
 }
 
 # Validate required environment variables
@@ -92,6 +100,7 @@ class PowerMonitor:
         self.chat_id = CONFIG["telegram_chat_id"]
         self.current_status = "UNKNOWN"
         self.last_outage_start = None
+        self.latest_state = None
         self.init_database()
         self.handle_startup_recovery()
 
@@ -238,12 +247,12 @@ class PowerMonitor:
 
         return now, duration
 
-    def write_state_file(self, power_on: bool):
-        """Export machine-readable power state for automated consumers.
+    def build_state(self, power_on: bool) -> Dict:
+        """Build the machine-readable power state payload.
 
-        Written atomically after every check so a reader never sees a partial
-        file. This is deliberately separate from the human Telegram alert:
-        consumers get a stable schema with no prose.
+        Deliberately separate from the human Telegram alert: consumers get a
+        stable schema with no prose. Shared by the state file and the optional
+        HTTP endpoint so both always agree.
 
         Schema (v1):
           schema           int     format version; refuse to act on unknown ones
@@ -253,11 +262,10 @@ class PowerMonitor:
           confirmed        bool    outage has lasted >= confirm_after
           checked_at       str     ISO8601 of this check; detects a wedged writer
         """
-        path = CONFIG["state_file"]
         now = datetime.now()
 
         if power_on or not self.last_outage_start:
-            state = {
+            return {
                 "schema": 1,
                 "state": "up",
                 "since": None,
@@ -265,16 +273,29 @@ class PowerMonitor:
                 "confirmed": False,
                 "checked_at": now.isoformat(),
             }
-        else:
-            elapsed = (now - self.last_outage_start).total_seconds()
-            state = {
-                "schema": 1,
-                "state": "down",
-                "since": self.last_outage_start.isoformat(),
-                "elapsed_seconds": int(elapsed),
-                "confirmed": elapsed >= CONFIG["confirm_after"],
-                "checked_at": now.isoformat(),
-            }
+
+        elapsed = (now - self.last_outage_start).total_seconds()
+        return {
+            "schema": 1,
+            "state": "down",
+            "since": self.last_outage_start.isoformat(),
+            "elapsed_seconds": int(elapsed),
+            "confirmed": elapsed >= CONFIG["confirm_after"],
+            "checked_at": now.isoformat(),
+        }
+
+    def write_state_file(self, power_on: bool):
+        """Write the state payload atomically, so readers never see a partial file.
+
+        Also caches it for the HTTP endpoint, which serves the last computed
+        state rather than re-deriving it.
+        """
+        state = self.build_state(power_on)
+        self.latest_state = state
+        path = CONFIG["state_file"]
+
+        if not path:
+            return
 
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -637,10 +658,65 @@ class TelegramBot:
         await self.application.start()
         await self.application.updater.start_polling()
 
+class StateHTTPServer(ThreadingHTTPServer):
+    """Serves the monitor's latest state to consumers on other machines."""
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, addr, monitor):
+        self.monitor = monitor
+        super().__init__(addr, StateHTTPHandler)
+
+
+class StateHTTPHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path.split("?")[0] not in ("/", "/state", "/agent/state"):
+            self.send_error(404)
+            return
+
+        state = self.server.monitor.latest_state
+        if state is None:
+            # No check has completed yet. 503 rather than a guess, so consumers
+            # fall back to "unknown" instead of inferring an outage.
+            body = json.dumps({"schema": 1, "state": "unknown",
+                               "reason": "no check completed yet"}).encode()
+            self.send_response(503)
+        else:
+            body = json.dumps(state).encode()
+            self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        logger.debug("state http: " + fmt % args)
+
+
+def start_http_server(monitor):
+    """Start the state endpoint if configured. Never fatal: the Telegram path
+    is safety-critical and must survive a port conflict here."""
+    port = CONFIG["http_port"]
+    if not port:
+        return None
+    try:
+        server = StateHTTPServer((CONFIG["http_bind"], port), monitor)
+    except Exception as e:
+        logger.error(f"Could not start state HTTP server on "
+                     f"{CONFIG['http_bind']}:{port}: {e}")
+        return None
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    logger.info(f"State endpoint listening on {CONFIG['http_bind']}:{port}")
+    return server
+
+
 async def main():
     """Main function"""
     monitor = PowerMonitor()
     bot = TelegramBot(monitor)
+
+    start_http_server(monitor)
 
     # Run both the monitor and the bot concurrently
     await asyncio.gather(

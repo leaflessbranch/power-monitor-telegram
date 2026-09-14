@@ -110,6 +110,8 @@ POWER_MONITOR_DB=/var/lib/power_monitor/power_cuts.db
 POWER_MONITOR_LOG=/var/log/power_monitor.log
 POWER_MONITOR_STATE_FILE=/run/power-monitor/state.json
 POWER_MONITOR_CONFIRM_AFTER=600   # seconds before an outage is "confirmed"
+POWER_MONITOR_HTTP_PORT=0         # 0 = disabled; set a port to serve state over HTTP
+POWER_MONITOR_HTTP_BIND=0.0.0.0
 ```
 
 ### Agent / Machine-Readable State
@@ -139,6 +141,36 @@ write.
 | `elapsed_seconds` | Seconds in the current outage; `0` when `up`. |
 | `confirmed` | `true` once the outage has lasted `POWER_MONITOR_CONFIRM_AFTER`. |
 | `checked_at` | ISO8601 of this check — lets readers spot a stalled writer. |
+
+The same payload is available two ways, so consumers work whether or not they
+share a machine with the monitor:
+
+**Same machine** — read the state file directly. Nothing to enable.
+
+```bash
+cat /run/power-monitor/state.json
+```
+
+**Another machine** — set `POWER_MONITOR_HTTP_PORT` and the monitor serves the
+same JSON over HTTP (stdlib only, no extra dependencies):
+
+```bash
+POWER_MONITOR_HTTP_PORT=8577
+```
+
+```bash
+curl http://<monitor-host>:8577/agent/state
+```
+
+`/`, `/state`, and `/agent/state` all return the payload. Before the first
+check completes the endpoint returns **503** with `"state": "unknown"` — treat
+that as unknown, not as an outage. There is no authentication: the payload
+carries nothing sensitive, but bind it to a trusted network and do not expose
+it to the internet.
+
+If the monitor runs in a container or VM and the consumer does not, either
+publish the HTTP port or bind-mount the state file out — the HTTP route is
+usually simpler.
 
 Notes for consumers:
 
