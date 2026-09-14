@@ -102,6 +102,57 @@ TELEGRAM_BOT_TOKEN=your_bot_token_here
 TELEGRAM_CHAT_ID=your_chat_id_here
 ```
 
+Optional path and behaviour overrides (defaults shown):
+
+```bash
+POWER_MONITOR_DEVICES=/etc/power-monitor/devices.json
+POWER_MONITOR_DB=/var/lib/power_monitor/power_cuts.db
+POWER_MONITOR_LOG=/var/log/power_monitor.log
+POWER_MONITOR_STATE_FILE=/run/power-monitor/state.json
+POWER_MONITOR_CONFIRM_AFTER=600   # seconds before an outage is "confirmed"
+```
+
+### Agent / Machine-Readable State
+
+Alongside the human Telegram alerts, the monitor writes a small JSON state file
+(`POWER_MONITOR_STATE_FILE`) after every check. It is intended for automated
+consumers — scripts, agents, dashboards — that need power state without parsing
+chat messages. The file is written atomically, so readers never see a partial
+write.
+
+```json
+{
+  "schema": 1,
+  "state": "down",
+  "since": "2026-01-31T19:38:01.546480",
+  "elapsed_seconds": 4231,
+  "confirmed": true,
+  "checked_at": "2026-01-31T20:48:52.113902"
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `schema` | Format version. Refuse to act on a version you don't know. |
+| `state` | `up` or `down` — whether any monitored device is reachable. |
+| `since` | ISO8601 start of the current outage; `null` when `up`. |
+| `elapsed_seconds` | Seconds in the current outage; `0` when `up`. |
+| `confirmed` | `true` once the outage has lasted `POWER_MONITOR_CONFIRM_AFTER`. |
+| `checked_at` | ISO8601 of this check — lets readers spot a stalled writer. |
+
+Notes for consumers:
+
+- **Wait for `confirmed`** before taking any disruptive action. Brief
+  unreachability is common and usually self-heals.
+- **Compute elapsed time from `since`**, not `elapsed_seconds`, if your reader
+  may have been asleep or restarted.
+- **Treat an unreadable, stale, or unknown-`schema` file as "unknown", never as
+  an outage.** Failing open prevents a monitor restart from looking like a
+  power cut to every consumer at once.
+- The default lives under `/run`, which is tmpfs — the file is absent until the
+  first check after boot. Point `POWER_MONITOR_STATE_FILE` elsewhere if you
+  need it to persist.
+
 ### Device Configuration
 
 Edit `/etc/power-monitor/devices.json`:
@@ -172,6 +223,7 @@ sudo systemctl disable power-monitor
 - **Configuration**: `/etc/power-monitor/`
 - **Database**: `/var/lib/power_monitor/power_cuts.db`
 - **Logs**: `/var/log/power_monitor.log`
+- **Agent state**: `/run/power-monitor/state.json`
 - **Service**: `/etc/systemd/system/power-monitor.service`
 
 ## Troubleshooting

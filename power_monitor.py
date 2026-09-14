@@ -16,18 +16,17 @@ from telegram.error import BadRequest
 
 def load_device_config():
     """Load device configuration from file"""
-    config_file = "/etc/power-monitor/devices.json"
-    default_devices = [
-        {"name": "WiproPlug", "ip": "10.10.10.61"},
-        {"name": "WiproBulb", "ip": "10.10.10.62"}
-    ]
+    config_file = os.environ.get("POWER_MONITOR_DEVICES", "/etc/power-monitor/devices.json")
+    default_devices = []
 
     try:
         with open(config_file, 'r') as f:
             data = json.load(f)
             return data.get("monitored_devices", default_devices)
     except Exception as e:
-        logger.warning(f"Could not load device config from {config_file}: {e}")
+        # Called at import time, before logging is configured, so use stderr.
+        print(f"WARNING: Could not load device config from {config_file}: {e}",
+              file=sys.stderr)
         return default_devices
 
 
@@ -41,8 +40,14 @@ CONFIG = {
     "check_interval": 30,  # seconds
     "ping_timeout": 5,     # seconds
     "ping_count": 5,       # number of pings per check
-    "db_path": "/var/lib/power_monitor/power_cuts.db",
-    "log_path": "/var/log/power_monitor.log"
+    "db_path": os.environ.get("POWER_MONITOR_DB", "/var/lib/power_monitor/power_cuts.db"),
+    "log_path": os.environ.get("POWER_MONITOR_LOG", "/var/log/power_monitor.log"),
+    # Machine-readable state export for automated consumers (agents, scripts).
+    # Written atomically after every check. Separate from the human Telegram alert.
+    "state_file": os.environ.get("POWER_MONITOR_STATE_FILE", "/run/power-monitor/state.json"),
+    # An outage is only reported as "confirmed" once it has lasted this long.
+    # Consumers that take disruptive action should ignore unconfirmed outages.
+    "confirm_after": int(os.environ.get("POWER_MONITOR_CONFIRM_AFTER", "600")),  # seconds
 }
 
 # Validate required environment variables
@@ -52,6 +57,11 @@ if not CONFIG["telegram_bot_token"]:
 
 if not CONFIG["telegram_chat_id"]:
     print("ERROR: TELEGRAM_CHAT_ID environment variable is not set!")
+    sys.exit(1)
+
+if not CONFIG["monitored_devices"]:
+    print("ERROR: No monitored devices configured!")
+    print("Add them to /etc/power-monitor/devices.json (see examples/devices.json.example).")
     sys.exit(1)
 
 # Setup logging
@@ -64,6 +74,12 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# httpx logs every request URL at INFO. Telegram API URLs embed the bot token,
+# so INFO-level httpx logging writes the token in cleartext to the log file and
+# the journal on every poll. Keep it at WARNING.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 class PowerMonitor:
     def __init__(self):
@@ -205,17 +221,71 @@ class PowerMonitor:
         now = datetime.now()
         duration = (now - self.last_outage_start).total_seconds()
 
+        # NOTE: ORDER BY/LIMIT on UPDATE requires SQLite built with
+        # SQLITE_ENABLE_UPDATE_DELETE_LIMIT. Debian's build enables it, but
+        # stock CPython and musl builds do not, where it is a syntax error.
+        # The subquery form is portable everywhere.
         cursor.execute(
             """UPDATE power_cuts
                SET end_time = ?, duration_seconds = ?, status = 'completed'
-               WHERE status = 'ongoing'
-               ORDER BY id DESC LIMIT 1""",
+               WHERE id = (SELECT id FROM power_cuts
+                           WHERE status = 'ongoing'
+                           ORDER BY id DESC LIMIT 1)""",
             (now, int(duration))
         )
         conn.commit()
         conn.close()
 
         return now, duration
+
+    def write_state_file(self, power_on: bool):
+        """Export machine-readable power state for automated consumers.
+
+        Written atomically after every check so a reader never sees a partial
+        file. This is deliberately separate from the human Telegram alert:
+        consumers get a stable schema with no prose.
+
+        Schema (v1):
+          schema           int     format version; refuse to act on unknown ones
+          state            str     "up" | "down" (device reachability)
+          since            str     ISO8601 start of current outage, null when up
+          elapsed_seconds  int     time in current outage, 0 when up
+          confirmed        bool    outage has lasted >= confirm_after
+          checked_at       str     ISO8601 of this check; detects a wedged writer
+        """
+        path = CONFIG["state_file"]
+        now = datetime.now()
+
+        if power_on or not self.last_outage_start:
+            state = {
+                "schema": 1,
+                "state": "up",
+                "since": None,
+                "elapsed_seconds": 0,
+                "confirmed": False,
+                "checked_at": now.isoformat(),
+            }
+        else:
+            elapsed = (now - self.last_outage_start).total_seconds()
+            state = {
+                "schema": 1,
+                "state": "down",
+                "since": self.last_outage_start.isoformat(),
+                "elapsed_seconds": int(elapsed),
+                "confirmed": elapsed >= CONFIG["confirm_after"],
+                "checked_at": now.isoformat(),
+            }
+
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = f"{path}.tmp"
+            with open(tmp, "w") as f:
+                json.dump(state, f)
+            os.replace(tmp, path)
+        except Exception as e:
+            # Never let state export break monitoring; the Telegram path is
+            # the safety-critical one.
+            logger.error(f"Could not write state file {path}: {e}")
 
     def get_current_status(self) -> Dict:
         """Get current power status and ongoing outage info"""
@@ -304,6 +374,8 @@ class PowerMonitor:
                     self.current_status = "POWER_ON" if power_on else "POWER_CUT"
                     if self.current_status == "POWER_CUT":
                         self.record_power_cut_start()
+
+                self.write_state_file(power_on)
 
             except Exception as e:
                 logger.error(f"Error in monitoring loop: {e}")
