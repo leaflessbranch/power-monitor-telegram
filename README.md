@@ -102,6 +102,89 @@ TELEGRAM_BOT_TOKEN=your_bot_token_here
 TELEGRAM_CHAT_ID=your_chat_id_here
 ```
 
+Optional path and behaviour overrides (defaults shown):
+
+```bash
+POWER_MONITOR_DEVICES=/etc/power-monitor/devices.json
+POWER_MONITOR_DB=/var/lib/power_monitor/power_cuts.db
+POWER_MONITOR_LOG=/var/log/power_monitor.log
+POWER_MONITOR_STATE_FILE=/run/power-monitor/state.json
+POWER_MONITOR_CONFIRM_AFTER=600   # seconds before an outage is "confirmed"
+POWER_MONITOR_HTTP_PORT=0         # 0 = disabled; set a port to serve state over HTTP
+POWER_MONITOR_HTTP_BIND=0.0.0.0
+```
+
+### Agent / Machine-Readable State
+
+Alongside the human Telegram alerts, the monitor writes a small JSON state file
+(`POWER_MONITOR_STATE_FILE`) after every check. It is intended for automated
+consumers — scripts, agents, dashboards — that need power state without parsing
+chat messages. The file is written atomically, so readers never see a partial
+write.
+
+```json
+{
+  "schema": 1,
+  "state": "down",
+  "since": "2026-01-31T19:38:01.546480",
+  "elapsed_seconds": 4231,
+  "confirmed": true,
+  "checked_at": "2026-01-31T20:48:52.113902"
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `schema` | Format version. Refuse to act on a version you don't know. |
+| `state` | `up` or `down` — whether any monitored device is reachable. |
+| `since` | ISO8601 start of the current outage; `null` when `up`. |
+| `elapsed_seconds` | Seconds in the current outage; `0` when `up`. |
+| `confirmed` | `true` once the outage has lasted `POWER_MONITOR_CONFIRM_AFTER`. |
+| `checked_at` | ISO8601 of this check — lets readers spot a stalled writer. |
+
+The same payload is available two ways, so consumers work whether or not they
+share a machine with the monitor:
+
+**Same machine** — read the state file directly. Nothing to enable.
+
+```bash
+cat /run/power-monitor/state.json
+```
+
+**Another machine** — set `POWER_MONITOR_HTTP_PORT` and the monitor serves the
+same JSON over HTTP (stdlib only, no extra dependencies):
+
+```bash
+POWER_MONITOR_HTTP_PORT=8577
+```
+
+```bash
+curl http://<monitor-host>:8577/agent/state
+```
+
+`/`, `/state`, and `/agent/state` all return the payload. Before the first
+check completes the endpoint returns **503** with `"state": "unknown"` — treat
+that as unknown, not as an outage. There is no authentication: the payload
+carries nothing sensitive, but bind it to a trusted network and do not expose
+it to the internet.
+
+If the monitor runs in a container or VM and the consumer does not, either
+publish the HTTP port or bind-mount the state file out — the HTTP route is
+usually simpler.
+
+Notes for consumers:
+
+- **Wait for `confirmed`** before taking any disruptive action. Brief
+  unreachability is common and usually self-heals.
+- **Compute elapsed time from `since`**, not `elapsed_seconds`, if your reader
+  may have been asleep or restarted.
+- **Treat an unreadable, stale, or unknown-`schema` file as "unknown", never as
+  an outage.** Failing open prevents a monitor restart from looking like a
+  power cut to every consumer at once.
+- The default lives under `/run`, which is tmpfs — the file is absent until the
+  first check after boot. Point `POWER_MONITOR_STATE_FILE` elsewhere if you
+  need it to persist.
+
 ### Device Configuration
 
 Edit `/etc/power-monitor/devices.json`:
@@ -172,6 +255,7 @@ sudo systemctl disable power-monitor
 - **Configuration**: `/etc/power-monitor/`
 - **Database**: `/var/lib/power_monitor/power_cuts.db`
 - **Logs**: `/var/log/power_monitor.log`
+- **Agent state**: `/run/power-monitor/state.json`
 - **Service**: `/etc/systemd/system/power-monitor.service`
 
 ## Troubleshooting

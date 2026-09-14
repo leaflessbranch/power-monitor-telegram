@@ -9,6 +9,8 @@ import logging
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 import subprocess
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 from telegram.constants import ParseMode
@@ -16,18 +18,17 @@ from telegram.error import BadRequest
 
 def load_device_config():
     """Load device configuration from file"""
-    config_file = "/etc/power-monitor/devices.json"
-    default_devices = [
-        {"name": "WiproPlug", "ip": "10.10.10.61"},
-        {"name": "WiproBulb", "ip": "10.10.10.62"}
-    ]
+    config_file = os.environ.get("POWER_MONITOR_DEVICES", "/etc/power-monitor/devices.json")
+    default_devices = []
 
     try:
         with open(config_file, 'r') as f:
             data = json.load(f)
             return data.get("monitored_devices", default_devices)
     except Exception as e:
-        logger.warning(f"Could not load device config from {config_file}: {e}")
+        # Called at import time, before logging is configured, so use stderr.
+        print(f"WARNING: Could not load device config from {config_file}: {e}",
+              file=sys.stderr)
         return default_devices
 
 
@@ -41,8 +42,20 @@ CONFIG = {
     "check_interval": 30,  # seconds
     "ping_timeout": 5,     # seconds
     "ping_count": 5,       # number of pings per check
-    "db_path": "/var/lib/power_monitor/power_cuts.db",
-    "log_path": "/var/log/power_monitor.log"
+    "db_path": os.environ.get("POWER_MONITOR_DB", "/var/lib/power_monitor/power_cuts.db"),
+    "log_path": os.environ.get("POWER_MONITOR_LOG", "/var/log/power_monitor.log"),
+    # Machine-readable state export for automated consumers (agents, scripts).
+    # Written atomically after every check. Separate from the human Telegram alert.
+    "state_file": os.environ.get("POWER_MONITOR_STATE_FILE", "/run/power-monitor/state.json"),
+    # An outage is only reported as "confirmed" once it has lasted this long.
+    # Consumers that take disruptive action should ignore unconfirmed outages.
+    "confirm_after": int(os.environ.get("POWER_MONITOR_CONFIRM_AFTER", "600")),  # seconds
+    # Optional read-only HTTP endpoint serving the same state, for consumers on
+    # other machines. Disabled unless a port is set. Stdlib only, no new deps.
+    # Bind to a LAN address or 0.0.0.0; the payload carries nothing sensitive,
+    # but there is no auth, so do not expose it to the internet.
+    "http_port": int(os.environ.get("POWER_MONITOR_HTTP_PORT", "0")),
+    "http_bind": os.environ.get("POWER_MONITOR_HTTP_BIND", "0.0.0.0"),
 }
 
 # Validate required environment variables
@@ -52,6 +65,11 @@ if not CONFIG["telegram_bot_token"]:
 
 if not CONFIG["telegram_chat_id"]:
     print("ERROR: TELEGRAM_CHAT_ID environment variable is not set!")
+    sys.exit(1)
+
+if not CONFIG["monitored_devices"]:
+    print("ERROR: No monitored devices configured!")
+    print("Add them to /etc/power-monitor/devices.json (see examples/devices.json.example).")
     sys.exit(1)
 
 # Setup logging
@@ -65,6 +83,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# httpx logs every request URL at INFO. Telegram API URLs embed the bot token,
+# so INFO-level httpx logging writes the token in cleartext to the log file and
+# the journal on every poll. Keep it at WARNING.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 class PowerMonitor:
     def __init__(self):
         self.db_path = CONFIG["db_path"]
@@ -76,6 +100,7 @@ class PowerMonitor:
         self.chat_id = CONFIG["telegram_chat_id"]
         self.current_status = "UNKNOWN"
         self.last_outage_start = None
+        self.latest_state = None
         self.init_database()
         self.handle_startup_recovery()
 
@@ -205,17 +230,83 @@ class PowerMonitor:
         now = datetime.now()
         duration = (now - self.last_outage_start).total_seconds()
 
+        # NOTE: ORDER BY/LIMIT on UPDATE requires SQLite built with
+        # SQLITE_ENABLE_UPDATE_DELETE_LIMIT. Debian's build enables it, but
+        # stock CPython and musl builds do not, where it is a syntax error.
+        # The subquery form is portable everywhere.
         cursor.execute(
             """UPDATE power_cuts
                SET end_time = ?, duration_seconds = ?, status = 'completed'
-               WHERE status = 'ongoing'
-               ORDER BY id DESC LIMIT 1""",
+               WHERE id = (SELECT id FROM power_cuts
+                           WHERE status = 'ongoing'
+                           ORDER BY id DESC LIMIT 1)""",
             (now, int(duration))
         )
         conn.commit()
         conn.close()
 
         return now, duration
+
+    def build_state(self, power_on: bool) -> Dict:
+        """Build the machine-readable power state payload.
+
+        Deliberately separate from the human Telegram alert: consumers get a
+        stable schema with no prose. Shared by the state file and the optional
+        HTTP endpoint so both always agree.
+
+        Schema (v1):
+          schema           int     format version; refuse to act on unknown ones
+          state            str     "up" | "down" (device reachability)
+          since            str     ISO8601 start of current outage, null when up
+          elapsed_seconds  int     time in current outage, 0 when up
+          confirmed        bool    outage has lasted >= confirm_after
+          checked_at       str     ISO8601 of this check; detects a wedged writer
+        """
+        now = datetime.now()
+
+        if power_on or not self.last_outage_start:
+            return {
+                "schema": 1,
+                "state": "up",
+                "since": None,
+                "elapsed_seconds": 0,
+                "confirmed": False,
+                "checked_at": now.isoformat(),
+            }
+
+        elapsed = (now - self.last_outage_start).total_seconds()
+        return {
+            "schema": 1,
+            "state": "down",
+            "since": self.last_outage_start.isoformat(),
+            "elapsed_seconds": int(elapsed),
+            "confirmed": elapsed >= CONFIG["confirm_after"],
+            "checked_at": now.isoformat(),
+        }
+
+    def write_state_file(self, power_on: bool):
+        """Write the state payload atomically, so readers never see a partial file.
+
+        Also caches it for the HTTP endpoint, which serves the last computed
+        state rather than re-deriving it.
+        """
+        state = self.build_state(power_on)
+        self.latest_state = state
+        path = CONFIG["state_file"]
+
+        if not path:
+            return
+
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = f"{path}.tmp"
+            with open(tmp, "w") as f:
+                json.dump(state, f)
+            os.replace(tmp, path)
+        except Exception as e:
+            # Never let state export break monitoring; the Telegram path is
+            # the safety-critical one.
+            logger.error(f"Could not write state file {path}: {e}")
 
     def get_current_status(self) -> Dict:
         """Get current power status and ongoing outage info"""
@@ -304,6 +395,8 @@ class PowerMonitor:
                     self.current_status = "POWER_ON" if power_on else "POWER_CUT"
                     if self.current_status == "POWER_CUT":
                         self.record_power_cut_start()
+
+                self.write_state_file(power_on)
 
             except Exception as e:
                 logger.error(f"Error in monitoring loop: {e}")
@@ -565,10 +658,65 @@ class TelegramBot:
         await self.application.start()
         await self.application.updater.start_polling()
 
+class StateHTTPServer(ThreadingHTTPServer):
+    """Serves the monitor's latest state to consumers on other machines."""
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, addr, monitor):
+        self.monitor = monitor
+        super().__init__(addr, StateHTTPHandler)
+
+
+class StateHTTPHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path.split("?")[0] not in ("/", "/state", "/agent/state"):
+            self.send_error(404)
+            return
+
+        state = self.server.monitor.latest_state
+        if state is None:
+            # No check has completed yet. 503 rather than a guess, so consumers
+            # fall back to "unknown" instead of inferring an outage.
+            body = json.dumps({"schema": 1, "state": "unknown",
+                               "reason": "no check completed yet"}).encode()
+            self.send_response(503)
+        else:
+            body = json.dumps(state).encode()
+            self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        logger.debug("state http: " + fmt % args)
+
+
+def start_http_server(monitor):
+    """Start the state endpoint if configured. Never fatal: the Telegram path
+    is safety-critical and must survive a port conflict here."""
+    port = CONFIG["http_port"]
+    if not port:
+        return None
+    try:
+        server = StateHTTPServer((CONFIG["http_bind"], port), monitor)
+    except Exception as e:
+        logger.error(f"Could not start state HTTP server on "
+                     f"{CONFIG['http_bind']}:{port}: {e}")
+        return None
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    logger.info(f"State endpoint listening on {CONFIG['http_bind']}:{port}")
+    return server
+
+
 async def main():
     """Main function"""
     monitor = PowerMonitor()
     bot = TelegramBot(monitor)
+
+    start_http_server(monitor)
 
     # Run both the monitor and the bot concurrently
     await asyncio.gather(
